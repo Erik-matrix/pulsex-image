@@ -18,7 +18,8 @@ The PulseX code is MIT (see LICENSE). It is built with the following, each under
 - **Qualcomm AI runtime (QAIRT)** - `flux-make.exe` is compiled against the QNN headers of Qualcomm's QAIRT SDK and
   loads `QnnHtp.dll` and `QnnSystem.dll` at run time. Neither the headers nor the runtime are in this repository;
   both are under Qualcomm's own license.
-- **QuickSRNet-Large** (Qualcomm AI Hub) - the optional upscaler. Not in this repository.
+- **QuickSRNet-Large** (Qualcomm AI Hub; BSD 3-Clause License) - the upscaler for enlarging. Not in this repository;
+  the compiled graph is with the model files on Hugging Face, with its license text.
 
 The table of Swedish words (`bin/flux_cues.tsv`) is PulseX's own, generated from `cues.json` of pulsex-zimage (MIT).
 

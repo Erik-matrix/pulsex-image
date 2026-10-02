@@ -74,12 +74,12 @@ pulsex-image\
     q8\       flux-2-klein-9b-q8_0-slim.gguf + .hexpack, qwen3-8b-flux2-q8_0-slim.gguf + .hexpack
     q4\       the same in Q4_0
     vae-qnn\  the picture decoder and encoder, one compiled file per shape, and bn.f32
+    sr-qnn\   the upscaler for enlarging
 ```
 
 `bin\flux.json` says where these are (paths relative to itself); edit it to keep the models elsewhere. The window
 offers what it finds: a shape needs its decoder file, "Best" and "Faster" need their model files, starting from a
-picture of your own needs the encoder of that shape. Enlarging needs one more file that is not on Hugging Face - see
-*Enlarging* below.
+picture of your own needs the encoder of that shape, enlarging needs the upscaler in `models\sr-qnn\`.
 
 ## Use
 
@@ -105,10 +105,11 @@ flux-make --enlarge picture.png [--up N] [--out file]                           
 
 ## Enlarging
 
-Enlarging uses QuickSRNet-Large x4 from [Qualcomm AI Hub](https://aihub.qualcomm.com/) as a compiled NPU graph
-(`quicksrnetlarge_512x512_ctx_qnn.bin`, for a 512 x 512 input; larger pictures go through it as overlapping tiles
-that cross-fade). The file is not redistributed here. `flux.json` names where it is expected
-(`models\sr-qnn\`); without it the window simply does not offer enlarging.
+Enlarging uses QuickSRNet-Large x4 from [Qualcomm AI Hub](https://aihub.qualcomm.com/models/quicksrnetlarge) as a
+compiled NPU graph (`quicksrnetlarge_512x512_ctx_qnn.bin`, for a 512 x 512 input; larger pictures go through it as
+overlapping tiles that cross-fade). Qualcomm releases the model under the BSD 3-Clause License; the compiled file
+comes with the models from Hugging Face (`models\sr-qnn\`, with its license text). Without it the window simply
+does not offer enlarging.
 
 ## How it works
 
