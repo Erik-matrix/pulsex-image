@@ -1,0 +1,14 @@
+{
+  "_about": "Where PulseX Image finds its files. Paths are relative to this file (or absolute). See README.md.",
+  "model": "q8",
+  "paths": {
+    "transformer_q8": "../models/q8/flux-2-klein-9b-q8_0-slim.gguf",
+    "encoder_q8": "../models/q8/qwen3-8b-flux2-q8_0-slim.gguf",
+    "transformer_q4": "../models/q4/flux-2-klein-9b-q4_0-slim.gguf",
+    "encoder_q4": "../models/q4/qwen3-8b-flux2-q4_0-slim.gguf",
+    "vae_qnn": "../models/vae-qnn",
+    "quicksrnet_x4": "../models/sr-qnn/quicksrnetlarge_512x512.onnx",
+    "qnn_runtime": "../qnn",
+    "cues": "flux_cues.tsv"
+  }
+}

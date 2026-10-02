@@ -1,0 +1,16 @@
+# the models and Qualcomm's runtime never belong in this repository
+models/
+qnn/
+*.gguf
+*.hexpack
+*.safetensors
+*.onnx
+*_ctx_qnn.bin
+
+# build output and scratch
+build/
+*.pdb
+*.obj
+*.ilk
+*.log
+__pycache__/
