@@ -42,9 +42,11 @@ The idle computer draws 7 W. The figures come from the battery's own gauge over 
   16 GB of memory. Other Snapdragon X chips are untested; the picture decoder on Hugging Face is compiled for this
   chip.
 - The [Microsoft Visual C++ Redistributable for ARM64](https://aka.ms/vs/17/release/vc_redist.arm64.exe).
-- Three files of **Qualcomm's AI runtime (QAIRT), version 2.46 or newer**: `QnnHtp.dll`, `QnnSystem.dll` and
-  `QnnHtpV73Stub.dll`, from `lib\aarch64-windows-msvc` of the QAIRT SDK. They are Qualcomm's and are not in this
-  repository. (The copies inside the `onnxruntime-qnn` Python package are older and refuse the decoder.)
+- Five files of **Qualcomm's AI runtime (QAIRT), version 2.46 or newer**, all from the same SDK: `QnnHtp.dll`,
+  `QnnSystem.dll` and `QnnHtpV73Stub.dll` from its `lib\aarch64-windows-msvc`, and the NPU-side module
+  `libQnnHtpV73Skel.so` with its catalog `libqnnhtpv73.cat` from its `lib\hexagon-v73\unsigned`. They are Qualcomm's
+  and are not in this repository. Without the last two the picture decoder stops with `qnn_open failed, 0x80000406`.
+  (The copies inside the `onnxruntime-qnn` Python package are older and refuse the decoder.)
 - The **models** from Hugging Face (below). 10 to 26 GB on a fast SSD.
 
 > **The NPU module is self-signed.** Windows only loads `bin\libggml-htp-v73.so` on a machine set up to accept
@@ -55,7 +57,7 @@ The idle computer draws 7 W. The figures come from the battery's own gauge over 
 
 1. Take the zip of the [latest release](https://github.com/Erik-matrix/pulsex-image/releases/latest) or clone the
    repository, into a folder whose path is plain A-Z (for example `C:\PulseX\image`).
-2. Put the three Qualcomm files in a folder `qnn` next to `bin`.
+2. Put the five Qualcomm files in a folder `qnn` next to `bin`.
 3. Get the models into a folder `models` next to `bin`:
 
    ```
@@ -69,7 +71,7 @@ The idle computer draws 7 W. The figures come from the battery's own gauge over 
 ```
 pulsex-image\
   bin\        the program (this repository)
-  qnn\        QnnHtp.dll, QnnSystem.dll, QnnHtpV73Stub.dll
+  qnn\        QnnHtp.dll, QnnSystem.dll, QnnHtpV73Stub.dll, libQnnHtpV73Skel.so, libqnnhtpv73.cat
   models\
     q8\       flux-2-klein-9b-q8_0-slim.gguf + .hexpack, qwen3-8b-flux2-q8_0-slim.gguf + .hexpack
     q4\       the same in Q4_0
