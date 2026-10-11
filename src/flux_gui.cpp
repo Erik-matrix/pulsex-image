@@ -28,6 +28,7 @@
 #include "flux_image.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +37,43 @@
 #include <mutex>
 #include <random>
 #include <thread>
+
+// ── which application this is. The same window is built twice: PulseX Image (FLUX.2 klein, runs flux-make.exe) and,
+//    with PULSEX_ZIMAGE defined, PulseX Z-Image (Z-Image-Turbo, runs zimage-make.exe). What differs between them is
+//    named here and asked for as `ZIMAGE` below - one model instead of two qualities, any shape instead of the compiled
+//    decoders, no editing of a picture, its own folders, its own colour. ──
+#ifdef PULSEX_ZIMAGE
+static const bool ZIMAGE = true;
+#define APP_NAME    "PulseX Z-Image"
+#define APP_NAME_W  L"PulseX Z-Image"
+#define APP_CLASS_W L"pulsex_zimage"
+#define APP_ICON    "pulsex-zimage.ico"
+#define MAKE_EXE    "zimage-make.exe"
+#define CFG_FILE    "zimage.json"
+#define CFG_ENV     "ZIMAGE_CONFIG"
+#define DATA_ENV    "PULSEX_ZIMAGE_DATA"
+#define OUT_ENV     "PULSEX_ZIMAGE_OUT"
+#define OUT_FOLDER  "PulseX Z-Image"
+#define DATA_FOLDER "PulseX Z-Image"
+#else
+static const bool ZIMAGE = false;
+#ifdef PULSEX_FLUX_NAME                          // 10-11: a local build may show the window as "PulseX Flux"; the
+#define APP_NAME    "PulseX Flux"                // published program is PulseX Image (FLUX is Black Forest Labs' name).
+#define APP_NAME_W  L"PulseX Flux"               // The exe, the folders and the repo are pulsex-image / PulseX Image either way
+#else
+#define APP_NAME    "PulseX Image"
+#define APP_NAME_W  L"PulseX Image"
+#endif
+#define APP_CLASS_W L"pulsex_image"
+#define APP_ICON    "pulsex-image.ico"
+#define MAKE_EXE    "flux-make.exe"
+#define CFG_FILE    "flux.json"
+#define CFG_ENV     "FLUX_CONFIG"
+#define DATA_ENV    "PULSEX_IMAGE_DATA"
+#define OUT_ENV     "PULSEX_IMAGE_OUT"
+#define OUT_FOLDER  "PulseX"
+#define DATA_FOLDER "PulseX Image"               // %LOCALAPPDATA%\PulseX Image: the settings and the history, as before the rename
+#endif
 
 // ── small things. The manifest makes the ANSI code page UTF-8, so every narrow string here is UTF-8. ──
 static std::string narrow(const wchar_t * w) {
@@ -119,6 +157,23 @@ static std::string json_str(const std::string & js, const std::string & key) {
     std::replace(v.begin(), v.end(), '/', '\\');
     return v;
 }
+// the text of the object after "key" (zimage.json keeps its paths in "paths"; some names are in "defaults" too)
+static std::string json_section(const std::string & js, const std::string & key) {
+    size_t k = js.find("\"" + key + "\"");
+    if (k == std::string::npos) return "";
+    k = js.find('{', k);
+    if (k == std::string::npos) return "";
+    int depth = 0;
+    bool in_str = false;                     // a brace inside a string ("{models}/...") does not count
+    for (size_t i = k; i < js.size(); i++) {
+        const char c = js[i];
+        if (in_str) { if (c == '\\') i++; else if (c == '"') in_str = false; continue; }
+        if (c == '"') in_str = true;
+        else if (c == '{') depth++;
+        else if (c == '}' && --depth == 0) return js.substr(k, i - k + 1);
+    }
+    return "";
+}
 static std::string name_of(const std::string & p) { const size_t s = p.find_last_of("\\/"); return s == std::string::npos ? p : p.substr(s + 1); }
 static bool is_picture_file(const std::string & p) {
     const size_t d = p.find_last_of('.');
@@ -168,9 +223,16 @@ static void CleanupDeviceD3D() {
 struct Tex {
     ID3D11ShaderResourceView * srv = nullptr;
     int w = 0, h = 0;
-    void drop() { if (srv) { srv->Release(); srv = nullptr; } w = h = 0; }
+    void drop();                                          // released after the frame is shown (release_later)
     ImTextureRef ref() const { return ImTextureRef((ImTextureID) (uintptr_t) srv); }
 };
+// 10-11 (PulseX Wan crashed in qcdx11arm64xum.dll on "Change …"; this window had the same: removing a reference picture
+// with its x crashed 3 of 3 times): a texture released while the frame being built still draws it is used by the GPU
+// after it is gone. Every texture the window gives up goes here and is released only after Present.
+static std::vector<IUnknown *> g_release_later;
+static void release_later(IUnknown * p) { if (p) g_release_later.push_back(p); }
+static void release_frame_end() { for (IUnknown * p : g_release_later) p->Release(); g_release_later.clear(); }
+void Tex::drop() { release_later(srv); srv = nullptr; w = h = 0; }
 static Tex make_tex(const uint8_t * rgba, int w, int h) {
     Tex t;
     D3D11_TEXTURE2D_DESC d{};
@@ -252,10 +314,13 @@ struct Loader {
 
 // ── window: no native frame. The title bar is ours; Windows still moves, snaps and maximises it (HTCAPTION). ──
 static float g_scale    = 1.0f;          // display scale (DPI / 96)
+static int   g_tab      = 0;             // 0 the picture, 1 the living picture (10-04)
+static std::string g_living_show;      // --living-show <a finished job's folder>
 static UINT  g_new_dpi  = 0;             // set by WM_DPICHANGED, applied by the main loop
 static int   g_cap_h    = 0;             // title-bar height in client pixels
 static RECT  g_nodrag[2] = {};           // title-bar areas that hold controls (language, window buttons)
 static std::vector<std::string> g_dropped;      // picture files dropped on the window
+static bool g_test_unref = false;               // --demo-unref: press the first reference picture's remove mark from inside the frame
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wP, LPARAM lP) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wP, lP)) return true;
@@ -328,9 +393,9 @@ static const ImVec4 C_BTN   = rgb( 92, 99,112);
 static const ImVec4 C_BTN_H = rgb(106,114,128);
 static const ImVec4 C_TEXT  = rgb(236,239,243);
 static const ImVec4 C_DIM   = rgb(170,178,190);
-static const ImVec4 C_ACC   = rgb( 42,166,154);            // teal
-static const ImVec4 C_ACC_H = rgb( 62,190,177);
-static const ImVec4 C_ACC_L = rgb( 34,134,125);
+static const ImVec4 C_ACC   = ZIMAGE ? rgb( 78,132,216) : rgb( 42,166,154);            // teal; Z-Image: blue, so the two windows are told apart
+static const ImVec4 C_ACC_H = ZIMAGE ? rgb(104,156,236) : rgb( 62,190,177);
+static const ImVec4 C_ACC_L = ZIMAGE ? rgb( 60,108,184) : rgb( 34,134,125);
 static const ImVec4 C_WARN  = rgb(232,184, 92);
 static const ImVec4 C_ERR   = rgb(236,120,110);
 
@@ -416,12 +481,17 @@ static void chip_flow(const char * next) {
 // 22.0 W Q8 512, 21.4 W Q4 512, 20.2 W Q8 1024; idle 7 W). Energy of a picture = that x its seconds, in Wh.
 static const double PICTURE_WATTS = 21.0;
 static double watt_hours(double seconds) { return PICTURE_WATTS * seconds / 3600.0; }
+// Z-Image's first estimate, until this machine has made a picture of the kind (zimage_dit/tools/make_shapes_1002.py):
+// seconds = base + per-1024-tokens x (tokens / 1024)^pow x steps / 4, + enlarging per 512 x 512 of picture.
+// Measured 10-02: 512 x 512 10.8 s, 768 x 512 14.4 s, 912 x 512 16.8 s, 1024 x 1024 39.5 s; enlarging 0.3-0.4 s.
+// Its energy has not been measured, so the Z-Image window shows seconds only.
+static const double ZI_EST_BASE = 2.6, ZI_EST_TOK = 8.05, ZI_EST_POW = 1.08, ZI_EST_UP = 0.4;
 
 // ════════════════════════ the application ════════════════════════
 struct SizeOpt { int w = 0, h = 0; bool encoder = false; };       // a compiled decoder; encoder = pictures of this size can be edited
 struct Meta { std::string prompt, model, title, sub, enrich, sent; bool top = false; unsigned seed = 0; int w = 0, h = 0, refs = 0, steps = 4, up = 0, bw = 0, bh = 0; double secs = 0; };   // w, h: the file's; up != 0: made bw x bh, then enlarged to the short side `up`
 struct Pic { std::string path; uint64_t when = 0; Tex thumb; int state = 0; };      // state: 0 not asked for, 1 asked, 2 there, 3 unreadable
-struct RefPic { std::string path; Tex thumb; int state = 0; };
+struct RefPic { std::string path; Tex thumb; int state = 0; int src_w = 0, src_h = 0; };     // src: the file's own size (10-11)
 struct Job {
     std::string prompt, model, out;
     int w = 512, h = 512, steps = 4, up = 0;
@@ -458,11 +528,16 @@ struct App {
     char prompt[4000] = "";
     char title[160] = "", sub[200] = "";                  // the poster's text; not kept between sessions
     bool text_top = false;
-    int size_ix = 0, up = 0, steps = 4, seed = 0;         // up: enlarge the finished picture 2 or 4 times (0 = no)
-    std::string model = "q8";
+    int size_ix = 0, up = ZIMAGE ? 2 : 0, steps = 4, seed = 0;         // up: enlarge the finished picture 2 or 4 times (0 = no; Z-Image: 512 -> 1024 is its usual way)
+    std::string model = ZIMAGE ? "q4" : "q8";
     bool random_seed = true, more = false;
     bool png = false;                                     // save as PNG (exact, three to four times the size) instead of JPEG
     bool swedish = true;                                  // the Norrland theme: help with Swedish words (flux-make --enrich nouns)
+    bool strip_on = false;                                // 10-10: the strip of earlier pictures under the big one, off by default
+    // 10-11 (picture to picture was there but not clear - e.g. one picture changed step by step into a fairy tale;
+    // better in the right panel): 1 = picture to picture - the right panel shows Before (refs[0]) and After
+    // (the picture made) side by side, the shape follows the Before picture, "Continue from After" chains the steps
+    int p2p = 0;
     std::string sent;                                     // what flux-make says it really sent, when that is not the prompt as typed
     std::vector<RefPic> refs;
     std::map<std::string, double> measured;               // "q8 512x512 r0 u0" -> seconds the last such picture took
@@ -493,21 +568,22 @@ struct App {
 
     void find_things() {
         bin = app_dir();
-        const char * e = getenv("FLUX_CONFIG");
-        cfg = e && *e ? e : bin + "\\flux.json";
-        const char * ed = getenv("PULSEX_IMAGE_DATA"), * eo = getenv("PULSEX_IMAGE_OUT");      // another settings / pictures folder (checks)
+        const char * e = getenv(CFG_ENV);
+        cfg = e && *e ? e : bin + "\\" CFG_FILE;
+        if (!(e && *e) && !file_exists(cfg) && file_exists(bin + "\\..\\" CFG_FILE)) cfg = bin + "\\..\\" CFG_FILE;      // bin\ under the folder with the settings file
+        const char * ed = getenv(DATA_ENV), * eo = getenv(OUT_ENV);      // another settings / pictures folder (checks)
         if (ed && *ed) data_dir = ed;
         else {
             data_dir = known_folder(FOLDERID_LocalAppData);
             if (data_dir.empty()) data_dir = bin;
-            data_dir += "\\PulseX Image";
+            data_dir += "\\" DATA_FOLDER;
         }
         CreateDirectoryW(to_w(data_dir).c_str(), nullptr);
         if (eo && *eo) out_dir = eo;
         else {
             out_dir = known_folder(FOLDERID_Pictures);
             if (out_dir.empty()) out_dir = data_dir;
-            out_dir += "\\PulseX";
+            out_dir += "\\" OUT_FOLDER;
         }
         CreateDirectoryW(to_w(out_dir).c_str(), nullptr);
 
@@ -520,6 +596,38 @@ struct App {
             if (p.empty()) return p;
             return full(((p.size() > 1 && p[1] == ':') || p[0] == '\\') ? p : base + "\\" + p);
         };
+        if (ZIMAGE) {
+            // zimage.json: the paths are in "paths", {models} stands for paths.models (as zimage-make reads it). One model;
+            // the engine takes any size divisible by 16, so the shapes are a fixed set; a picture cannot be edited.
+            const std::string paths = json_section(js, "paths");
+            const std::string m0 = json_str(paths, "models");
+            const std::string models = m0.empty() ? m0 : full(((m0.size() > 1 && m0[1] == ':') || m0[0] == '\\') ? m0 : base + "\\" + m0);
+            auto zat = [&](const std::string & key) {
+                std::string p = json_str(paths, key);
+                const size_t m = p.find("{models}");
+                if (m != std::string::npos) p = models + p.substr(m + 8);
+                if (p.empty()) return p;
+                return full(((p.size() > 1 && p[1] == ':') || p[0] == '\\') ? p : base + "\\" + p);
+            };
+            has_q4 = file_exists(zat("dit")) && file_exists(zat("encoder"));
+            has_q8 = false;
+            std::string sr = zat("quicksrnet_x4");                // the compiled context, under either name zimage.py leaves it (as zimage-make)
+            if (sr.size() > 5 && sr.substr(sr.size() - 5) == ".onnx") sr = sr.substr(0, sr.size() - 5);
+            has_up = (file_exists(sr + "_ctx_qnn.bin") || file_exists(sr + "_512x512_ctx_qnn.bin") || file_exists(sr))
+                     && file_exists(zat("qnn_runtime") + "\\QnnHtp.dll");      // and the runtime that runs it: without it there is nothing to offer
+            sizes.clear();
+            for (const SizeOpt & s : { SizeOpt{ 512, 512, false }, SizeOpt{ 512, 768, false }, SizeOpt{ 768, 512, false }, SizeOpt{ 912, 512, false }, SizeOpt{ 1024, 1024, false } })
+                sizes.push_back(s);
+            not_ready.clear();
+            if (!file_exists(bin + "\\" MAKE_EXE)) not_ready = tr("Programmet zimage-make.exe saknas bredvid appen.", "zimage-make.exe is missing next to the app.");
+            else if (js.empty()) not_ready = tr("Inställningsfilen zimage.json hittades inte.", "The settings file zimage.json was not found.");
+            else if (!has_q4) not_ready = tr("Modellfilerna hittades inte (se zimage.json).", "The model files were not found (see zimage.json).");
+            else if (!file_exists(zat("taef1")) || !file_exists(models + "\\taef1\\diffusion_pytorch_model.safetensors"))
+                not_ready = tr("Bildavkodaren saknas (taef1, se zimage.json).", "The picture decoder is missing (taef1, see zimage.json).");
+            ready = not_ready.empty();
+            model = "q4";
+            return;
+        }
         vae_qnn = at("vae_qnn");
         has_q4 = file_exists(at("transformer_q4")) && file_exists(at("encoder_q4"));
         has_q8 = file_exists(at("transformer_q8")) && file_exists(at("encoder_q8"));
@@ -541,7 +649,8 @@ struct App {
             FindClose(h);
         }
         std::sort(sizes.begin(), sizes.end(), [](const SizeOpt & a, const SizeOpt & b) { return a.w * a.h != b.w * b.h ? a.w * a.h < b.w * b.h : a.w < b.w; });
-        if (!file_exists(bin + "\\flux-make.exe")) not_ready = tr("Programmet flux-make.exe saknas bredvid appen.", "flux-make.exe is missing next to the app.");
+        not_ready.clear();
+        if (!file_exists(bin + "\\" MAKE_EXE)) not_ready = tr("Programmet flux-make.exe saknas bredvid appen.", "flux-make.exe is missing next to the app.");
         else if (js.empty()) not_ready = tr("Inställningsfilen flux.json hittades inte.", "The settings file flux.json was not found.");
         else if (!has_q4 && !has_q8) not_ready = tr("Modellfilerna hittades inte (se flux.json).", "The model files were not found (see flux.json).");
         else if (sizes.empty() || !file_exists(vae_qnn + "\\bn.f32")) not_ready = tr("Bildavkodaren saknas (mappen vae-qnn).", "The picture decoder is missing (the vae-qnn folder).");
@@ -565,6 +674,8 @@ struct App {
             else if (k == "random") random_seed = atoi(v.c_str()) != 0;
             else if (k == "swedish") swedish = atoi(v.c_str()) != 0;
             else if (k == "png") png = atoi(v.c_str()) != 0;
+            else if (k == "strip") strip_on = atoi(v.c_str()) != 0;
+            else if (k == "p2p") p2p = atoi(v.c_str()) != 0 ? 1 : 0;
             else if (k == "prompt") snprintf(prompt, sizeof prompt, "%s", v.c_str());
             else if (k.compare(0, 5, "time ") == 0) measured[k.substr(5)] = atof(v.c_str());
         }
@@ -576,7 +687,7 @@ struct App {
         if (test_run) return;
         std::string s ="lang=" + std::to_string(g_lang) + "\nmodel=" + model + "\nsize=" + std::to_string(size().w) + "x" + std::to_string(size().h) +
                         "\nupx=" + std::to_string(up) + "\nsteps=" + std::to_string(steps) + "\nseed=" + std::to_string(seed) + "\nrandom=" + std::to_string(random_seed ? 1 : 0) + "\nswedish=" + std::to_string(swedish ? 1 : 0) + "\npng=" + std::to_string(png ? 1 : 0) +
-                        "\nprompt=" + esc(prompt) + "\n";
+                        "\nstrip=" + std::to_string(strip_on ? 1 : 0) + "\np2p=" + std::to_string(p2p) + "\nprompt=" + esc(prompt) + "\n";
         for (const auto & kv : measured) { char b[32]; snprintf(b, sizeof b, "%.1f", kv.second); s += "time " + kv.first + "=" + b + "\n"; }
         write_all(settings_file(), s);
     }
@@ -641,6 +752,7 @@ struct App {
         const auto it = measured.find(est_key(mdl, w, h, nref, upv, st));
         if (it != measured.end()) return it->second;
         const double tok = (double) (w / 16) * (h / 16) * (1 + 0.75 * nref);       // 2 references, Q8, 512 x 512: 44 s measured
+        if (ZIMAGE) return ZI_EST_BASE + ZI_EST_TOK * pow(tok / 1024.0, ZI_EST_POW) * st / 4.0 + (upv ? ZI_EST_UP * (double) w * h / (512.0 * 512.0) : 0.0);
         return 5.7 + 0.014 * tok * (mdl == "q8" ? 1.13 : 1.0) * st / 4.0 + (nref ? 1.5 : 0.0) + (upv ? 0.6 : 0.0);
     }
     // the enlarged picture's short side for the chosen shape and factor (what flux-make --up takes), 0 = not enlarged
@@ -732,14 +844,14 @@ struct App {
     // the worker: flux-make.exe, its stdout and stderr through one pipe, line by line
     void work() {
         const auto & q = quote_arg;
-        std::string cmd = q(bin + "\\flux-make.exe");
+        std::string cmd = q(bin + "\\" MAKE_EXE);
         if (!job.text_src.empty()) cmd += " --add-text " + q(job.text_src) + " --out " + q(job.out);
         else if (!job.enlarge_src.empty()) cmd += " --enlarge " + q(job.enlarge_src) + " --up " + std::to_string(job.up) + " --progress --config " + q(cfg) + " --out " + q(job.out);
         else {
             const std::string pf = data_dir + "\\prompt.txt";
             write_all(pf, job.prompt);
             cmd += " --prompt-file " + q(pf) + " --progress --config " + q(cfg) + " --size " + std::to_string(job.w) + "x" + std::to_string(job.h) +
-                   " --seed " + std::to_string(job.seed) + " --steps " + std::to_string(job.steps) + " --model " + job.model + " --out " + q(job.out);
+                   " --seed " + std::to_string(job.seed) + " --steps " + std::to_string(job.steps) + (ZIMAGE ? "" : " --model " + job.model) + " --out " + q(job.out);
             if (job.up) cmd += " --up " + std::to_string(job.up);
             if (job.enrich != "off") cmd += " --enrich " + job.enrich;
             for (const std::string & r : job.refs) cmd += " --image " + q(r);
@@ -791,7 +903,7 @@ struct App {
     // how far along (0..1) and what to call the stage
     float fraction(std::string & what) {
         std::lock_guard<std::mutex> l(m);
-        const double e_text = 3.0, e_ref = job.refs.empty() ? 0.0 : 1.5, e_pic = 1.2 + (job.up ? 0.6 : 0.0);
+        const double e_text = ZIMAGE ? 1.2 : 3.0, e_ref = job.refs.empty() ? 0.0 : 1.5, e_pic = (ZIMAGE ? 0.8 : 1.2) + (job.up ? 0.6 : 0.0);
         const double e_steps = (std::max)(4.0, job.est - e_text - e_ref - e_pic), total = e_text + e_ref + e_steps + e_pic;
         const double el = now_s() - t_stage;
         double before = 0, cur = e_text;
@@ -805,13 +917,13 @@ struct App {
             snprintf(b, sizeof b, tr("Målar – steg %d av %d", "Painting – step %d of %d"), (std::min)(step + 1, nsteps), nsteps);
             what = b;
         }
-        else if (stage == "upscale") { before = e_text + e_ref + e_steps + 1.2; cur = 0.6; what = tr("Förstorar …", "Enlarging …"); }
+        else if (stage == "upscale") { before = e_text + e_ref + e_steps + (ZIMAGE ? 0.8 : 1.2); cur = 0.6; what = tr("Förstorar …", "Enlarging …"); }
         else { before = e_text + e_ref + e_steps; cur = e_pic; what = tr("Framkallar bilden …", "Developing the picture …"); }
         return (float) ((before + (std::min)(el, cur * 0.95)) / total);
     }
 
     void add_ref(const std::string & path) {
-        if (!is_picture_file(path) || refs.size() >= 2) return;
+        if (!can_edit() || !is_picture_file(path) || refs.size() >= 2) return;      // (Z-Image cannot edit: a dropped picture is not taken)
         for (const RefPic & r : refs) if (r.path == path) return;
         RefPic r;
         r.path = path;
@@ -820,6 +932,26 @@ struct App {
             for (size_t i = 0; i < sizes.size(); i++) if (sizes[i].encoder) { size_ix = (int) i; break; }
     }
     bool can_edit() const { for (const SizeOpt & s : sizes) if (s.encoder) return true; return false; }
+    // picture to picture: the one Before picture (any earlier references go)
+    void set_start(const std::string & path) {
+        if (!can_edit() || !is_picture_file(path)) return;
+        for (RefPic & r : refs) r.thumb.drop();
+        refs.clear();
+        add_ref(path);
+    }
+    // the shape whose proportions are nearest the Before picture's, among those that can edit (the picture is not cropped
+    // to another shape); a tie keeps the shape chosen
+    void fit_size(int w, int h) {
+        const double want = std::log((double) w / (double) h);
+        int best = -1;
+        double bd = 1e9;
+        for (size_t i = 0; i < sizes.size(); i++) {
+            if (!sizes[i].encoder) continue;
+            const double d = std::fabs(std::log((double) sizes[i].w / (double) sizes[i].h) - want) - ((int) i == size_ix ? 1e-6 : 0.0);
+            if (d < bd) { bd = d; best = (int) i; }
+        }
+        if (best >= 0) size_ix = best;
+    }
 
     // once per frame: finished pictures, loaded textures, dropped files
     void pump() {
@@ -843,7 +975,10 @@ struct App {
                     { const int m = (std::min)(job.w, job.h); mt.w = job.up ? job.w * job.up / m : job.w; mt.h = job.up ? job.h * job.up / m : job.h; }
                     mt.refs = (int) job.refs.size(); mt.steps = job.steps; mt.secs = secs; mt.up = job.up;
                     mt.enrich = job.enrich; { std::lock_guard<std::mutex> l(m); mt.sent = sent; }
-                    measured[est_key(job.model, job.w, job.h, (int) job.refs.size(), job.up, job.steps)] = secs;
+                    // the next estimate for this kind of picture. A run far slower than the last one was a cold start (the
+                    // model read from the disk again - Z-Image from an SD card: 73 s instead of 15) and says nothing about the next.
+                    double & known = measured[est_key(job.model, job.w, job.h, (int) job.refs.size(), job.up, job.steps)];
+                    if (known <= 0 || secs < 1.8 * known) known = secs;
                 }
                 mt.title = job.title; mt.sub = job.sub; mt.top = job.top;
                 history_add(job.out, mt);
@@ -853,19 +988,27 @@ struct App {
                 std::lock_guard<std::mutex> l(m);
                 error = tr("Det gick inte att skapa bilden.", "The picture could not be made.");
                 error_detail = log.size() > 1500 ? log.substr(log.size() - 1500) : log;
-                if (rc == 100 && error_detail.empty()) error_detail = "flux-make.exe could not be started";
+                if (rc == 100 && error_detail.empty()) error_detail = MAKE_EXE " could not be started";
             }
             settings_save();
         }
-        for (const std::string & f : g_dropped) add_ref(f);
+        for (const std::string & f : g_dropped) { if (p2p) set_start(f); else add_ref(f); }     // picture to picture: a dropped picture is Before
         g_dropped.clear();
+        for (RefPic & r : refs) if (r.state == 0) { r.state = 1; loader.push(LoadReq{ r.path, 1024, 2 }); }   // big enough for the Before view
         LoadRes r;
         while (loader.pop(r)) {
             Tex t = r.ok ? make_tex(r.rgba.data(), r.w, r.h) : Tex();
             bool used = false;
             if (r.req.kind == 0 && r.req.path == sel) { view.drop(); view = t; view_path = sel; view_w = r.src_w; view_h = r.src_h; used = true; }
             if (r.req.kind == 1) for (Pic & p : pics) if (p.path == r.req.path && p.state == 1) { p.thumb = t; p.state = t.srv ? 2 : 3; used = true; break; }
-            if (r.req.kind == 2) for (RefPic & p : refs) if (p.path == r.req.path && p.state == 1) { p.thumb = t; p.state = t.srv ? 2 : 3; used = true; break; }
+            if (r.req.kind == 2)
+                for (size_t i = 0; i < refs.size(); i++) {
+                    RefPic & p = refs[i];
+                    if (p.path != r.req.path || p.state != 1) continue;
+                    p.thumb = t; p.state = t.srv ? 2 : 3; p.src_w = r.src_w; p.src_h = r.src_h; used = true;
+                    if (i == 0 && p2p && p.src_w > 0) fit_size(p.src_w, p.src_h);
+                    break;
+                }
             if (!used) t.drop();
         }
         if (!sel.empty() && !view_asked) { view_asked = true; loader.push(LoadReq{ sel, 1600, 0 }, true); }
@@ -882,6 +1025,8 @@ static void draw_cover(ImDrawList * dl, const Tex & t, ImVec2 p, float side, flo
 
 static std::string size_name(const SizeOpt & s) {
     if (s.w == s.h) return s.w <= 512 ? tr("Kvadrat", "Square") : tr("Stor kvadrat", "Large square");
+    if (s.w * 10 >= s.h * 22) return tr("Panorama", "Panorama");         // 10-11: 1152 x 432 (8:3) was a second "Wide"
+    if (s.w * 10 >= s.h * 17) return tr("Bred", "Wide");                 // 16:9
     return s.w > s.h ? tr("Liggande", "Landscape") : tr("Stående", "Portrait");
 }
 
@@ -903,9 +1048,18 @@ static void draw_left(App & a, HWND hWnd) {
     ImGui::BeginChild("##choices", ImVec2(0, ImGui::GetContentRegionAvail().y - action_h - st.ItemSpacing.y), 0, 0);
     ImGui::BeginDisabled(a.running);
 
-    begin_card("##prompt", ImVec2(0, 0), tr("Beskriv bilden", "Describe the picture"), ImGuiChildFlags_AutoResizeY);
+    begin_card("##prompt", ImVec2(0, 0), a.p2p ? tr("Beskriv förändringen", "Describe the change") : tr("Beskriv bilden", "Describe the picture"), ImGuiChildFlags_AutoResizeY);
     ImGui::InputTextMultiline("##p", a.prompt, sizeof a.prompt, ImVec2(-1, lines_h(5)), ImGuiInputTextFlags_WordWrap);
-    if (!a.prompt[0]) {
+    if (!a.prompt[0] && a.p2p) {                          // 10-11: changes that keep the picture (FLUX.2 edits, the Before picture stays the frame)
+        hint(tr("Säg vad som ska bli annorlunda – resten står kvar. Till exempel:", "Say what should be different – the rest stays. For example:"));
+        static const char * EX2[] = { "A painted Christmas fairy tale, the same scene",
+                                      "A snowy winter night, candlelight in the windows",
+                                      "An old storybook watercolour",
+                                      "Add a starry sky and a shepherd with a lantern" };
+        ImGui::PushFont(nullptr, FS * 0.90f);
+        for (const char * e : EX2) if (ImGui::Selectable(e)) snprintf(a.prompt, sizeof a.prompt, "%s", e);
+        ImGui::PopFont();
+    } else if (!a.prompt[0]) {
         hint(tr("Prova till exempel:", "Try for example:"));
         static const char * EX[] = { "A moose in a snowy spruce forest under the northern lights",          // the Norrland motifs of zimage
                                      "Reindeer grazing on the autumn mountain tundra",
@@ -917,7 +1071,7 @@ static void draw_left(App & a, HWND hWnd) {
     }
     end_card();
 
-    begin_card("##look", ImVec2(0, 0), tr("Format och kvalitet", "Shape and quality"), ImGuiChildFlags_AutoResizeY);
+    begin_card("##look", ImVec2(0, 0), ZIMAGE ? tr("Format och storlek", "Shape and size") : tr("Format och kvalitet", "Shape and quality"), ImGuiChildFlags_AutoResizeY);
     label(tr("Format", "Shape"));
     for (size_t i = 0; i < a.sizes.size(); i++) {
         const SizeOpt & s = a.sizes[i];
@@ -949,9 +1103,10 @@ static void draw_left(App & a, HWND hWnd) {
         const int w = upv ? a.size().w * upv / m : a.size().w, h = upv ? a.size().h * upv / m : a.size().h;
         char b[200];
         const double est = a.estimate(a.model, a.size().w, a.size().h, (int) a.refs.size(), upv, a.steps);
-        snprintf(b, sizeof b, tr("%d × %d punkter · ungefär %.0f sekunder · ungefär %.2f Wh", "%d × %d pixels · about %.0f seconds · about %.2f Wh"), w, h, est, watt_hours(est));
+        if (ZIMAGE) snprintf(b, sizeof b, tr("%d × %d punkter · ungefär %.0f sekunder", "%d × %d pixels · about %.0f seconds"), w, h, est);
+        else snprintf(b, sizeof b, tr("%d × %d punkter · ungefär %.0f sekunder · ungefär %.2f Wh", "%d × %d pixels · about %.0f seconds · about %.2f Wh"), w, h, est, watt_hours(est));
         hint(b);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Energin för hela datorn medan bilden görs (cirka 21 W, mätt på batteri).",
+        if (!ZIMAGE && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Energin för hela datorn medan bilden görs (cirka 21 W, mätt på batteri).",
                                                              "The energy of the whole computer while the picture is made (about 21 W, measured on battery)."));
     }
     end_card();
@@ -971,15 +1126,14 @@ static void draw_left(App & a, HWND hWnd) {
     }
     end_card();
 
-    if (a.can_edit()) {
+    if (a.can_edit() && !a.p2p) {                         // picture to picture keeps its Before picture in the right panel
         begin_card("##refs", ImVec2(0, 0), tr("Utgå från en egen bild (valfritt)", "Start from a picture of your own (optional)"), ImGuiChildFlags_AutoResizeY);
         const float side = px(76);
         ImDrawList * dl = ImGui::GetWindowDrawList();
         int remove = -1;
         for (size_t i = 0; i < a.refs.size(); i++) {
             RefPic & r = a.refs[i];
-            if (r.state == 0) { r.state = 1; a.loader.push(LoadReq{ r.path, 256, 2 }); }
-            ImGui::PushID((int) i);
+            ImGui::PushID((int) i);                       // (loaded by pump, 10-11)
             const ImVec2 p = ImGui::GetCursorScreenPos();
             ImGui::InvisibleButton("##ref", ImVec2(side, side));
             dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side), ImGui::GetColorU32(C_INPUT), px(12));
@@ -988,6 +1142,7 @@ static void draw_left(App & a, HWND hWnd) {
             ImGui::SameLine(0, px(4));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, px(10));
             if (ImGui::Button("\xC3\x97", ImVec2(px(30), px(30)))) remove = (int) i;          // multiplication sign as the remove mark
+            else if (g_test_unref && i == 0 && r.state == 2) { remove = 0; g_test_unref = false; }    // test hook --demo-unref: the same, once its thumbnail is drawn
             ImGui::PopStyleVar();
             ImGui::PopID();
             ImGui::SameLine(0, px(12));
@@ -1010,11 +1165,16 @@ static void draw_left(App & a, HWND hWnd) {
     ImGui::PopStyleColor();
     if (a.more) {
         ImGui::Checkbox(tr("Förstå svenska ord (älg, fors, norrsken …)", "Understand Swedish words (älg, fors, norrsken …)"), &a.swedish);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Lägger det engelska ordet först i beskrivningen. Utan svenska ord skickas den som den är skriven.",
-                                                             "Puts the English word first in the description. Without Swedish words it is sent as typed."));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ZIMAGE ? tr("Lägger till det engelska ordet i beskrivningen. Utan svenska ord skickas den som den är skriven.",
+                                                                      "Adds the English word to the description. Without Swedish words it is sent as typed.")
+                                                                 : tr("Lägger det engelska ordet först i beskrivningen. Utan svenska ord skickas den som den är skriven.",
+                                                                      "Puts the English word first in the description. Without Swedish words it is sent as typed."));
         ImGui::Checkbox(tr("Spara som PNG i stället för JPG", "Save as PNG instead of JPG"), &a.png);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("PNG sparar bilden exakt men blir tre till fyra gånger så stor. JPG (kvalitet 95) ser likadan ut.",
                                                              "PNG keeps the picture exact but is three to four times the size. JPG (quality 95) looks the same."));
+        if (ImGui::Checkbox(tr("Visa tidigare bilder under bilden", "Show earlier pictures under the picture"), &a.strip_on)) a.settings_save();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("En rad med de senaste bilderna. Utan den får bilden hela höjden; alla bilder finns kvar i mappen (Visa i mappen).",
+                                                             "A row of the latest pictures. Without it the picture gets the full height; every picture stays in the folder (Show in folder)."));
         ImGui::Checkbox(tr("Ny variant varje gång", "A new variation every time"), &a.random_seed);
         label(tr("Variantnummer (samma nummer och beskrivning ger samma bild)", "Variation number (the same number and description give the same picture)"));
         ImGui::BeginDisabled(a.random_seed);
@@ -1022,7 +1182,7 @@ static void draw_left(App & a, HWND hWnd) {
         ImGui::InputInt("##seed", &a.seed, 0, 0);
         if (a.seed < 0) a.seed = 0;
         ImGui::EndDisabled();
-        label(tr("Antal steg (4 är modellens eget val)", "Number of steps (4 is the model's own choice)"));
+        label(ZIMAGE ? tr("Antal steg (4 är det vanliga)", "Number of steps (4 is the usual)") : tr("Antal steg (4 är modellens eget val)", "Number of steps (4 is the model's own choice)"));
         ImGui::SetNextItemWidth(px(170));
         ImGui::SliderInt("##steps", &a.steps, 2, 8);
     }
@@ -1052,9 +1212,11 @@ static void draw_left(App & a, HWND hWnd) {
     } else if (!a.ready) {
         hint(a.not_ready.c_str(), C_WARN);
     } else {
-        ImGui::BeginDisabled(!a.prompt[0]);
+        const bool need_before = a.p2p && a.refs.empty();   // picture to picture without a Before picture: nothing to change yet
+        ImGui::BeginDisabled(!a.prompt[0] || need_before);
         if (primary_button(a.refs.empty() ? tr("Skapa bild", "Create picture") : tr("Ändra bilden", "Change the picture"), ImVec2(-1, px(54)))) a.start();
         ImGui::EndDisabled();
+        if (need_before) hint(tr("Välj bilden du utgår från till höger (Före).", "Choose the picture to start from on the right (Before)."));
         if (!a.error.empty()) {
             hint(a.error.c_str(), C_ERR);
             if (ImGui::IsItemHovered() && !a.error_detail.empty()) {
@@ -1092,17 +1254,73 @@ static void draw_left(App & a, HWND hWnd) {
 }
 
 // ── right: the picture, what it was made from, the earlier ones ──
-static void draw_right(App & a) {
+// a picture fitted into a box (or a text when there is none), with a small label in its corner
+static void draw_fitted(ImDrawList * dl, const Tex & t, ImVec2 p0, ImVec2 sz, const char * empty_text, const char * label_text, float empty_aspect = 0) {
+    if (t.srv || empty_aspect > 0) {                        // the picture, or an empty frame of the shape it will have
+        const float tw = t.srv ? (float) t.w : empty_aspect, th = t.srv ? (float) t.h : 1.0f;
+        const float k = (std::min)(sz.x / tw, sz.y / th);
+        const float w = tw * k, h = th * k;
+        const ImVec2 p(p0.x + (sz.x - w) * 0.5f, p0.y + (sz.y - h) * 0.5f);
+        p0 = p; sz = ImVec2(w, h);
+    }
+    if (t.srv) {
+        dl->AddImageRounded(t.ref(), p0, ImVec2(p0.x + sz.x, p0.y + sz.y), ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, px(14));
+    } else {
+        dl->AddRectFilled(p0, ImVec2(p0.x + sz.x, p0.y + sz.y), ImGui::GetColorU32(C_INPUT), px(14));
+        const ImVec2 ts = ImGui::CalcTextSize(empty_text, nullptr, false, sz.x - px(40));
+        dl->AddText(nullptr, 0.0f, ImVec2(p0.x + (sz.x - ts.x) * 0.5f, p0.y + (sz.y - ts.y) * 0.5f), ImGui::GetColorU32(C_DIM), empty_text, nullptr, sz.x - px(40));
+    }
+    if (label_text) {                                       // "Before" / "After" on a dark pill in the corner
+        const ImVec2 ls = ImGui::CalcTextSize(label_text);
+        const ImVec2 a0(p0.x + px(10), p0.y + px(10)), a1(a0.x + ls.x + px(20), a0.y + ls.y + px(8));
+        dl->AddRectFilled(a0, a1, IM_COL32(20, 22, 26, 190), (a1.y - a0.y) * 0.5f);
+        dl->AddText(ImVec2(a0.x + px(10), a0.y + px(4)), ImGui::GetColorU32(C_TEXT), label_text);
+    }
+}
+
+static void draw_right(App & a, HWND hWnd) {
     const ImGuiStyle & st = ImGui::GetStyle();
     begin_card("##view", ImVec2(0, 0), nullptr, 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    const float strip = px(84), strip_h = strip + st.ScrollbarSize + px(8);
+    // 10-11: the mode - a new picture from words, or picture to picture (Before / After)
+    if (a.can_edit()) {
+        ImGui::BeginDisabled(a.running);
+        if (chip(tr("Ny bild###m0", "New picture###m0"), a.p2p == 0)) { a.p2p = 0; a.settings_save(); }
+        ImGui::SameLine();
+        if (chip(tr("Bild till bild###m1", "Picture to picture###m1"), a.p2p == 1)) {
+            a.p2p = 1;
+            if (!a.refs.empty() && a.refs[0].src_w > 0) a.fit_size(a.refs[0].src_w, a.refs[0].src_h);
+            a.settings_save();
+        }
+        ImGui::EndDisabled();
+        if (a.p2p) { ImGui::SameLine(); ImGui::AlignTextToFramePadding(); hint(tr("Före blir Efter – resten av bilden står kvar.", "Before becomes After – the rest of the picture stays.")); }
+    }
+    const float strip = px(84), strip_h = a.strip_on ? strip + st.ScrollbarSize + px(8) : 0.0f;
     const float info_h = 2 * ImGui::GetTextLineHeightWithSpacing() + ImGui::GetFrameHeightWithSpacing();
     const ImVec2 av = ImGui::GetContentRegionAvail();
-    const float area_h = (std::max)(px(120), av.y - strip_h - info_h - 3 * st.ItemSpacing.y);
+    const float area_h = (std::max)(px(120), av.y - strip_h - info_h - (a.strip_on ? 3 : 2) * st.ItemSpacing.y);
     ImDrawList * dl = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("##picture", ImVec2(av.x, area_h));
     const bool have = a.view.srv && a.view_path == a.sel && !a.sel.empty();
+    if (a.p2p) {                                            // Before | After, side by side (stacked in a tall panel)
+        const bool side = av.x >= area_h * 1.1f;
+        const float gap = px(12);
+        const ImVec2 box = side ? ImVec2((av.x - gap) * 0.5f, area_h) : ImVec2(av.x, (area_h - gap) * 0.5f);
+        const ImVec2 q0 = p0, q1 = side ? ImVec2(p0.x + box.x + gap, p0.y) : ImVec2(p0.x, p0.y + box.y + gap);
+        ImGui::InvisibleButton("##before", box);
+        const RefPic * b = a.refs.empty() ? nullptr : &a.refs[0];
+        draw_fitted(dl, b && b->state == 2 ? b->thumb : Tex(), q0, box,
+                    b ? (b->state == 3 ? tr("Bilden gick inte att läsa.", "The picture could not be read.") : tr("Hämtar bilden …", "Loading the picture …"))
+                      : tr("Dra in bilden du utgår från här – eller välj den nedan.", "Drop the picture to start from here – or choose it below."),
+                    tr("Före", "Before"));
+        ImGui::SetCursorScreenPos(q1);
+        ImGui::InvisibleButton("##after", box);
+        if (have && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) ShellExecuteW(nullptr, L"open", to_w(a.sel).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        draw_fitted(dl, have ? a.view : Tex(), q1, box,
+                    a.running ? tr("Ändrar bilden …", "Changing the picture …") : tr("Den ändrade bilden visas här.", "The changed picture appears here."), tr("Efter", "After"),
+                    (float) a.size().w / (float) a.size().h);
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + area_h + st.ItemSpacing.y));
+    } else {
+    ImGui::InvisibleButton("##picture", ImVec2(av.x, area_h));
     if (have) {
         const float k = (std::min)(av.x / a.view.w, area_h / a.view.h);
         const float w = a.view.w * k, h = a.view.h * k;
@@ -1114,6 +1332,7 @@ static void draw_right(App & a) {
         const char * t = a.sel.empty() ? tr("Din bild visas här", "Your picture appears here") : tr("Hämtar bilden …", "Loading the picture …");
         const ImVec2 ts = ImGui::CalcTextSize(t);
         dl->AddText(ImVec2(p0.x + (av.x - ts.x) * 0.5f, p0.y + (area_h - ts.y) * 0.5f), ImGui::GetColorU32(C_DIM), t);
+    }
     }
 
     // what it was made from
@@ -1130,7 +1349,8 @@ static void draw_right(App & a) {
     ImGui::EndChild();
     if (mt && ImGui::IsItemHovered()) {
         char b[200];
-        snprintf(b, sizeof b, tr("%d × %d · variant %u · %s · %.0f s · ungefär %.2f Wh", "%d × %d · variation %u · %s · %.0f s · about %.2f Wh"), mt->w, mt->h, mt->seed,
+        if (ZIMAGE) snprintf(b, sizeof b, tr("%d × %d · variant %u · %.0f s", "%d × %d · variation %u · %.0f s"), mt->w, mt->h, mt->seed, mt->secs);
+        else snprintf(b, sizeof b, tr("%d × %d · variant %u · %s · %.0f s · ungefär %.2f Wh", "%d × %d · variation %u · %s · %.0f s · about %.2f Wh"), mt->w, mt->h, mt->seed,
                  mt->model == "q8" ? tr("bäst", "best") : tr("snabbare", "faster"), mt->secs, watt_hours(mt->secs));
         ImGui::BeginTooltip();
         ImGui::PushTextWrapPos(px(560));
@@ -1149,10 +1369,22 @@ static void draw_right(App & a) {
         ShellExecuteW(nullptr, L"open", L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
     }
     ImGui::EndDisabled();
-    ImGui::BeginDisabled(a.sel.empty() || a.running);
-    if (a.can_edit()) {
+    if (a.p2p) {                                            // picture to picture: choose Before, or go on from After
         ImGui::SameLine();
-        if (ImGui::Button(tr("Ändra den här bilden", "Change this picture"))) { for (RefPic & r : a.refs) r.thumb.drop(); a.refs.clear(); a.add_ref(a.sel); a.prompt[0] = 0; }
+        ImGui::BeginDisabled(a.running);
+        if (ImGui::Button(tr("Välj Före …", "Choose Before …"))) { std::string f; if (pick_picture(hWnd, f)) a.set_start(f); }
+        ImGui::EndDisabled();
+        const bool after_new = !a.sel.empty() && (a.refs.empty() || a.refs[0].path != a.sel);
+        ImGui::BeginDisabled(!after_new || a.running);
+        ImGui::SameLine();
+        if (ImGui::Button(a.refs.empty() ? tr("Använd bilden som visas", "Use the picture shown") : tr("Fortsätt från Efter", "Continue from After"))) a.set_start(a.sel);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tr("Efter blir nästa Före – så byggs sagan upp steg för steg.", "After becomes the next Before – the tale is built step by step."));
+        ImGui::EndDisabled();
+    }
+    ImGui::BeginDisabled(a.sel.empty() || a.running);
+    if (a.can_edit() && !a.p2p) {
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Ändra den här bilden", "Change this picture"))) { a.p2p = 1; a.set_start(a.sel); a.prompt[0] = 0; a.settings_save(); }
     }
     if (mt) {
         ImGui::SameLine();
@@ -1176,7 +1408,8 @@ static void draw_right(App & a) {
     }
     ImGui::EndDisabled();
 
-    // the earlier pictures, newest first
+    // the earlier pictures, newest first (only when switched on under "More settings")
+    if (!a.strip_on) { end_card(); return; }
     ImGui::BeginChild("##strip", ImVec2(0, strip_h), 0, ImGuiWindowFlags_HorizontalScrollbar);
     ImDrawList * sdl = ImGui::GetWindowDrawList();
     for (size_t i = 0; i < a.pics.size(); i++) {
@@ -1200,6 +1433,232 @@ static void draw_right(App & a) {
 }
 
 // Title bar: name, language, window buttons. Dragging is done by Windows (WM_NCHITTEST) outside the two control areas.
+
+// ── the "Living picture" tab (10-04): a picture in, a film out - living\living_job.py does the work ──
+struct LivingTab {
+    std::string python, living, src, out, film, preview_path, error, found;
+    int kind = 0;                                          // 0 water, 1 person, 2 animal
+    bool sound = true;
+    std::thread th;
+    std::mutex m;
+    std::string stage, log;
+    double t0 = 0;
+    std::atomic<bool> running{ false }, finished{ false };
+    int rc = 0;
+    // the preview: small frames, played in the window
+    std::vector<uint8_t> frames;                           // n * pw * ph * 3
+    int pw = 0, ph = 0, nf = 0;
+    ID3D11Texture2D * tex = nullptr;
+    ID3D11ShaderResourceView * srv = nullptr;
+    double play0 = 0;
+    int shown = -1;
+
+    void find() {
+        const char * e = getenv("PULSEX_PYTHON");
+        python = e && *e ? e : "";
+        if (python.empty()) {
+            const std::string la = known_folder(FOLDERID_LocalAppData);
+            for (const char * v : { "\\Programs\\Python\\Python312-arm64\\python.exe", "\\Programs\\Python\\Python312\\python.exe" })
+                if (file_exists(la + v)) { python = la + v; break; }
+        }
+        const char * l = getenv("PULSEX_LIVING");
+        living = l && *l ? l : app_dir() + "\\..\\..\\..\\living";   // the developer's tree: build-wos\\bin -> PulseX\\living
+    }
+    bool ready() const { return !python.empty() && file_exists(living + "\\living_job.py"); }
+
+    void start(const std::string & out_root) {
+        if (running || src.empty()) return;
+        SYSTEMTIME t; GetLocalTime(&t);
+        char stamp[64];
+        snprintf(stamp, sizeof stamp, "%04d%02d%02d_%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        std::string stem = name_of(src);
+        const size_t dot = stem.find_last_of('.');
+        if (dot != std::string::npos) stem = stem.substr(0, dot);
+        static const char * kinds[] = { "water", "person", "animal" };
+        CreateDirectoryW(to_w(out_root + "\\Levande").c_str(), nullptr);
+        out = out_root + "\\Levande\\" + stem + "_" + kinds[kind] + "_" + stamp;
+        drop_preview();
+        error.clear(); found.clear(); film.clear();
+        { std::lock_guard<std::mutex> lk(m); stage = "start"; log.clear(); }
+        t0 = now_s();
+        finished = false; running = true;
+        if (th.joinable()) th.join();
+        th = std::thread([this, k = std::string(kinds[kind])]() { work(k); });
+    }
+    void work(const std::string & k) {
+        const auto & q = quote_arg;
+        std::string cmd = q(python) + " -u " + q(living + "\\living_job.py") + " " + q(src) + " --kind " + k + " --out " + q(out);
+        if (!sound) cmd += " --no-sound";
+        std::wstring w = to_w(cmd);
+        SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
+        HANDLE rd = nullptr, wr = nullptr;
+        int code = 100;
+        if (CreatePipe(&rd, &wr, &sa, 0)) {
+            SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+            STARTUPINFOW si{};
+            si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = wr; si.hStdError = wr;
+            PROCESS_INFORMATION pi{};
+            const BOOL ok = CreateProcessW(nullptr, &w[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, to_w(living).c_str(), &si, &pi);
+            CloseHandle(wr);
+            if (ok) {
+                std::string line;
+                char b[1024];
+                DWORD n = 0;
+                while (ReadFile(rd, b, sizeof b, &n, nullptr) && n)
+                    for (DWORD i = 0; i < n; i++) {
+                        if (b[i] == '\n') { on_line(line); line.clear(); }
+                        else if (b[i] != '\r') line += b[i];
+                    }
+                if (!line.empty()) on_line(line);
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                DWORD ec = 1;
+                GetExitCodeProcess(pi.hProcess, &ec);
+                code = (int) ec;
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            }
+            CloseHandle(rd);
+        }
+        rc = code;
+        finished = true;
+    }
+    void on_line(const std::string & line) {
+        std::lock_guard<std::mutex> lk(m);
+        if (line.compare(0, 9, "PROGRESS ") == 0) { stage = line.substr(9); return; }
+        if (line.compare(0, 6, "FOUND ") == 0) { found = line.substr(6); return; }
+        if (line.compare(0, 6, "ERROR ") == 0) { error = line.substr(6); return; }
+        if (line.compare(0, 7, "RESULT ") == 0) {
+            const std::vector<std::string> f = split(line.substr(7), ' ');
+            if (f.size() >= 5) { film = f[0]; preview_path = f[1]; pw = atoi(f[2].c_str()); ph = atoi(f[3].c_str()); nf = atoi(f[4].c_str()); }
+            return;
+        }
+        log += line + "\n";
+    }
+    const char * stage_text() {
+        std::lock_guard<std::mutex> lk(m);
+        if (stage == "read") return tr("Läser bilden …", "Reading the picture …");
+        if (stage == "water") return tr("Letar efter vattnet, fall och stenar …", "Finding the water, falls and stones …");
+        if (stage == "person") return tr("Letar efter personens leder …", "Finding the person's joints …");
+        if (stage == "animal") return tr("Letar efter djuret …", "Finding the animal …");
+        if (stage == "plate") return tr("Tar fram det som syns bakom …", "Painting what is behind …");
+        if (stage == "frames") return tr("Gör rörelserna …", "Making the motion …");
+        if (stage == "preview") return tr("Gör förhandsvisningen …", "Making the preview …");
+        return tr("Startar …", "Starting …");
+    }
+    void drop_preview() {
+        release_later(srv); srv = nullptr;
+        release_later(tex); tex = nullptr;
+        frames.clear(); shown = -1;
+    }
+    void pump() {
+        if (running && finished) {
+            if (th.joinable()) th.join();
+            running = false;
+            if (rc != 0 && error.empty()) { std::lock_guard<std::mutex> lk(m); error = log.size() > 300 ? log.substr(log.size() - 300) : log; }
+            if (rc == 0 && pw > 0 && nf > 0) {
+                const std::string raw = read_all(preview_path);
+                if (raw.size() == (size_t) pw * ph * 3 * nf) {
+                    frames.assign(raw.begin(), raw.end());
+                    D3D11_TEXTURE2D_DESC d{};
+                    d.Width = (UINT) pw; d.Height = (UINT) ph; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DYNAMIC; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                    if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&d, nullptr, &tex)) && tex) g_pd3dDevice->CreateShaderResourceView(tex, nullptr, &srv);
+                    play0 = now_s();
+                }
+            }
+        }
+        if (srv && !frames.empty()) {                      // the frame of this moment, 24 a second, round and round
+            const int f = (int) ((now_s() - play0) * 24.0) % nf;
+            if (f != shown) {
+                D3D11_MAPPED_SUBRESOURCE ms{};
+                if (SUCCEEDED(g_pd3dDeviceContext->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                    const uint8_t * s3 = frames.data() + (size_t) f * pw * ph * 3;
+                    for (int y = 0; y < ph; y++) {
+                        uint8_t * d4 = (uint8_t *) ms.pData + (size_t) y * ms.RowPitch;
+                        for (int x = 0; x < pw; x++, s3 += 3, d4 += 4) { d4[0] = s3[0]; d4[1] = s3[1]; d4[2] = s3[2]; d4[3] = 255; }
+                    }
+                    g_pd3dDeviceContext->Unmap(tex, 0);
+                    shown = f;
+                }
+            }
+        }
+    }
+};
+
+static void draw_living(App & a, LivingTab & L, HWND hWnd) {
+    const ImVec2 av = ImGui::GetContentRegionAvail();
+    const float leftw = (std::min)(px(470), av.x * 0.42f);
+    ImGui::BeginChild("##lleft", ImVec2(leftw, av.y), 0, ImGuiWindowFlags_NoScrollbar);
+    begin_card("##lpic", ImVec2(0, 0), tr("Bild att väcka till liv", "Picture to bring to life"), ImGuiChildFlags_AutoResizeY);
+    if (L.src.empty() && !a.sel.empty()) L.src = a.sel;
+    hint(L.src.empty() ? tr("Ingen bild vald.", "No picture chosen.") : name_of(L.src).c_str(), L.src.empty() ? C_DIM : C_TEXT);
+    if (!a.sel.empty() && a.sel != L.src && !L.running) { if (ImGui::Button(tr("Använd bilden som visas", "Use the picture shown"))) L.src = a.sel; ImGui::SameLine(); }
+    if (!L.running && ImGui::Button(tr("Välj bild …", "Choose a picture …"))) { std::string f; if (pick_picture(hWnd, f)) L.src = f; }
+    end_card();
+    begin_card("##lkind", ImVec2(0, 0), tr("Vad ska röra sig?", "What should move?"), ImGuiChildFlags_AutoResizeY);
+    if (chip(tr("Vatten###lk0", "Water###lk0"), L.kind == 0, !L.running)) L.kind = 0;
+    chip_flow(tr("Människa", "Person"));
+    if (chip(tr("Människa###lk1", "Person###lk1"), L.kind == 1, !L.running)) L.kind = 1;
+    chip_flow(tr("Djur", "Animal"));
+    if (chip(tr("Djur###lk2", "Animal###lk2"), L.kind == 2, !L.running)) L.kind = 2;
+    static const char * about[3][2] = {
+        { "Forsar och fall: bilden läser själv av vatten, fall och stenar. Strömmen, skummet och vattenröken räknas på NPU:n, med forsens ljud.",
+          "Rapids and falls: the picture itself tells the water, falls and stones. The current, the foam and the spray are computed on the NPU, with the sound of the rapids." },
+        { "En person: lederna hittas på NPU:n och kroppen rör sig i 3D i en gemensam rytm – andning, viktförskjutning och blickar.",
+          "A person: the joints are found on the NPU and the body moves in 3-D in one rhythm – breathing, the weight shifting, looks." },
+        { "Ett djur: det andas, vänder huvudet och sänker det som när det betar.",
+          "An animal: it breathes, turns its head and lowers it as when it grazes." } };
+    hint(about[L.kind][g_lang ? 1 : 0]);
+    if (L.kind == 0) ImGui::Checkbox(tr("Med ljud", "With sound"), &L.sound);
+    end_card();
+    ImGui::Dummy(ImVec2(0, px(6)));
+    if (!L.ready()) hint(tr("Python eller living-mappen hittades inte (PULSEX_PYTHON, PULSEX_LIVING).", "Python or the living folder was not found (PULSEX_PYTHON, PULSEX_LIVING)."), C_WARN);
+    else if (L.running) {
+        char b[160];
+        snprintf(b, sizeof b, "%s  %.0f s", L.stage_text(), now_s() - L.t0);
+        hint(b, C_TEXT);
+        const double typical = L.kind == 0 ? 150.0 : L.kind == 1 ? 190.0 : 150.0;
+        ImGui::ProgressBar((float) (std::min)(0.97, (now_s() - L.t0) / typical), ImVec2(-1, px(10)), "");
+    } else {
+        const bool can = !L.src.empty() && !a.running;
+        ImGui::BeginDisabled(!can);
+        if (primary_button(tr("Väck bilden till liv", "Bring it to life"), ImVec2(-1, px(52)))) {
+            const std::string busy = App::npu_busy();
+            if (busy.empty()) L.start(a.out_dir);
+            else { std::lock_guard<std::mutex> lk(L.m); L.error = std::string(tr("NPU:n används av ", "The NPU is in use by ")) + busy; }
+        }
+        ImGui::EndDisabled();
+        if (a.running) hint(tr("Väntar tills bilden är klar.", "Waiting for the picture to be finished."));
+        hint(tr("Tar ungefär 2–3 minuter. Datorn går att använda under tiden.", "Takes about 2–3 minutes. The PC can be used meanwhile."));
+    }
+    { std::lock_guard<std::mutex> lk(L.m); if (!L.error.empty()) hint(L.error.c_str(), C_ERR); }
+    ImGui::EndChild();
+    ImGui::SameLine(0, px(16));
+    ImGui::BeginChild("##lright", ImVec2(0, av.y), 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    begin_card("##lview", ImVec2(0, 0), nullptr, 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const ImVec2 vav = ImGui::GetContentRegionAvail();
+    const float area_h = vav.y - ImGui::GetFrameHeightWithSpacing() - px(8);
+    if (L.srv) {
+        const float k = (std::min)(vav.x / L.pw, area_h / L.ph);
+        const ImVec2 sz(L.pw * k, L.ph * k);
+        ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + (vav.x - sz.x) * 0.5f, ImGui::GetCursorPosY() + (area_h - sz.y) * 0.5f));
+        ImGui::Image(ImTextureRef((ImTextureID) (uintptr_t) L.srv), sz);
+        ImGui::SetCursorPosY(area_h + px(8));
+        if (ImGui::Button(tr("Spela filmen", "Play the film"))) ShellExecuteW(nullptr, L"open", to_w(L.film).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Öppna mappen", "Open the folder"))) ShellExecuteW(nullptr, L"open", to_w(L.out).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    } else {
+        const bool have = a.view.srv && a.view_path == L.src && !L.src.empty();
+        if (have) {
+            const float k = (std::min)(vav.x / a.view.w, area_h / a.view.h);
+            const ImVec2 sz(a.view.w * k, a.view.h * k);
+            ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + (vav.x - sz.x) * 0.5f, ImGui::GetCursorPosY() + (area_h - sz.y) * 0.5f));
+            ImGui::ImageWithBg(a.view.ref(), sz, ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), ImVec4(1, 1, 1, L.running ? 0.55f : 1.0f));
+        } else hint(tr("Filmen visas här när den är klar.", "The film shows here when it is done."));
+    }
+    end_card();
+    ImGui::EndChild();
+}
+
 static void draw_titlebar(HWND hWnd, bool & done, App & a) {
     ImDrawList * dl = ImGui::GetWindowDrawList();
     const ImVec2 o = ImGui::GetWindowPos();
@@ -1211,7 +1670,7 @@ static void draw_titlebar(HWND hWnd, bool & done, App & a) {
     ImGui::PushFont(g_semi, FS * 1.05f);
     const float th = ImGui::GetTextLineHeight();
     ImGui::SetCursorScreenPos(ImVec2(o.x + px(50), cy - th * 0.5f));
-    ImGui::TextUnformatted("PulseX Image");
+    ImGui::TextUnformatted(APP_NAME);
     ImGui::PopFont();
     const float bw = px(46), bx = o.x + W - 3 * bw;
     // language
@@ -1288,11 +1747,13 @@ static bool save_backbuffer(const std::string & path) {
 // ════════════════════════ main ════════════════════════
 int main(int argc, char ** argv) {
     std::string shot, demo, demo_size, demo_model, demo_title, demo_sub, demo_enrich, demo_format;
-    bool demo_top = false, demo_addtext = false, demo_enlarge = false;
+    bool demo_top = false, demo_addtext = false, demo_enlarge = false, demo_p2p = false;
     int lang_arg = -1, shot_w = 0, shot_h = 0, demo_seed = -1, demo_up = -1;
     for (int i = 1; i < argc; i++) {
         const std::string s = argv[i];
         if (s == "--shot" && i + 1 < argc) shot = argv[++i];
+        else if (s == "--tab" && i + 1 < argc) g_tab = atoi(argv[++i]);                     // test hooks of the living tab (10-04)
+        else if (s == "--living-show" && i + 1 < argc) g_living_show = argv[++i];        // a finished job's folder: its preview plays
         else if (s == "--demo-run" && i + 1 < argc) demo = argv[++i];
         else if (s == "--lang" && i + 1 < argc) lang_arg = std::string(argv[++i]) == "en" ? 1 : 0;
         else if (s == "--demo-ref" && i + 1 < argc) g_dropped.push_back(argv[++i]);          // as if the picture had been dropped on the window
@@ -1306,12 +1767,14 @@ int main(int argc, char ** argv) {
         else if (s == "--demo-enrich" && i + 1 < argc) demo_enrich = argv[++i];                 // off | nouns
         else if (s == "--demo-format" && i + 1 < argc) demo_format = argv[++i];                 // png | jpg
         else if (s == "--demo-addtext") demo_addtext = true;
+        else if (s == "--demo-unref") g_test_unref = true;                                // with --demo-ref: remove it again mid-frame (10-11)
+        else if (s == "--demo-p2p") demo_p2p = true;                                      // picture to picture (10-11); --demo-ref is then Before
         else if (s == "--demo-enlarge") demo_enlarge = true;                                  // press "Enlarge 2x" on the newest picture                                  // press "Add the text" on the newest picture (no NPU)
         else if (s == "--window" && i + 2 < argc) { shot_w = atoi(argv[++i]); shot_h = atoi(argv[++i]); }
     }
-    WNDCLASSEXW wc{ sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandle(nullptr), nullptr, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, L"pulsex_image", nullptr };
-    wc.hIcon = (HICON) LoadImageW(nullptr, to_w(app_dir() + "\\pulsex-image.ico").c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);    // tools\make_icon_1002.py
-    wc.hIconSm = (HICON) LoadImageW(nullptr, to_w(app_dir() + "\\pulsex-image.ico").c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE);
+    WNDCLASSEXW wc{ sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandle(nullptr), nullptr, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, APP_CLASS_W, nullptr };
+    wc.hIcon = (HICON) LoadImageW(nullptr, to_w(app_dir() + "\\" APP_ICON).c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);    // tools\make_icon_1002.py
+    wc.hIconSm = (HICON) LoadImageW(nullptr, to_w(app_dir() + "\\" APP_ICON).c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE);
     RegisterClassExW(&wc);
     g_scale = GetDpiForSystem() / 96.0f;
     RECT wa{ 0, 0, 1280, 1024 };
@@ -1320,7 +1783,7 @@ int main(int argc, char ** argv) {
     const int winW = shot_w ? shot_w : (std::min)((int) (1400 * g_scale), waW - (int) (24 * g_scale));
     const int winH = shot_h ? shot_h : (std::min)((int) (900 * g_scale), waH - (int) (24 * g_scale));
     const int winX = wa.left + (waW - winW) / 2, winY = wa.top + (waH - winH) / 2;
-    HWND hWnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_ACCEPTFILES, wc.lpszClassName, L"PulseX Image",
+    HWND hWnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_ACCEPTFILES, wc.lpszClassName, APP_NAME_W,
                                 WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU,   // no native caption
                                 winX, winY, winW, winH, nullptr, nullptr, wc.hInstance, nullptr);
     {
@@ -1353,10 +1816,17 @@ int main(int argc, char ** argv) {
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     static App app;
+    static LivingTab living;
+    living.find();
+    if (!g_living_show.empty()) {                          // load a finished job as if it had just finished
+        const std::string r = read_all(g_living_show + "\\result.txt");
+        if (!r.empty()) { living.on_line(r.substr(0, r.find_first_of("\r\n"))); living.out = g_living_show; living.rc = 0; living.finished = true; living.running = true; }
+    }
     g_lang = 1;                                            // English first; Swedish is one click away
     app.find_things();
     app.settings_load();
     if (lang_arg >= 0) g_lang = lang_arg;
+    if (demo_p2p) app.p2p = 1;
     app.find_things();                                     // again: the messages in the chosen language
     app.history_load();
     app.scan_pics();
@@ -1383,10 +1853,11 @@ int main(int argc, char ** argv) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); if (msg.message == WM_QUIT) quit_asked = true; }
         // Throttle when minimised or not in focus: no busy loop. (A running picture still moves its bar.)
-        if (IsIconic(hWnd) && shot.empty()) { Sleep(120); app.pump(); if (quit_asked && !app.running) break; continue; }
+        if (IsIconic(hWnd) && shot.empty()) { Sleep(120); app.pump(); living.pump(); if (quit_asked && !app.running && !living.running) break; continue; }
         if (GetForegroundWindow() != hWnd && shot.empty()) Sleep(30);
         if (g_new_dpi) { g_scale = g_new_dpi / 96.0f; g_new_dpi = 0; apply_style(); }
         app.pump();
+        living.pump();
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -1394,7 +1865,7 @@ int main(int argc, char ** argv) {
         ImGui::SetNextWindowPos(vp->Pos);
         ImGui::SetNextWindowSize(vp->Size);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        ImGui::Begin("PulseX Image", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse
+        ImGui::Begin(APP_NAME, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse
                                                | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::PopStyleVar();
         bool close_clicked = false;
@@ -1404,6 +1875,13 @@ int main(int argc, char ** argv) {
         ImGui::SetCursorPos(ImVec2(mg, (float) g_cap_h + px(2)));
         ImGui::BeginChild("##page", ImVec2(ImGui::GetWindowSize().x - 2 * mg, ImGui::GetWindowSize().y - g_cap_h - px(2) - mg), 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         {
+            if (chip(tr("Bild###tab0", "Picture###tab0"), g_tab == 0)) g_tab = 0;      // 10-04: the tabs
+            chip_flow(tr("Levande bild", "Living picture"));
+            if (chip(tr("Levande bild###tab1", "Living picture###tab1"), g_tab == 1)) g_tab = 1;
+            if (living.running) { ImGui::SameLine(); hint(tr("(arbetar …)", "(working …)"), C_WARN); }
+            ImGui::Dummy(ImVec2(0, px(2)));
+            if (g_tab == 1) draw_living(app, living, hWnd);
+            else {
             const ImVec2 av = ImGui::GetContentRegionAvail();
             const float leftw = (std::min)(px(470), av.x * 0.42f);
             ImGui::BeginChild("##left", ImVec2(leftw, av.y), 0, ImGuiWindowFlags_NoScrollbar);
@@ -1411,11 +1889,12 @@ int main(int argc, char ** argv) {
             ImGui::EndChild();
             ImGui::SameLine(0, px(16));
             ImGui::BeginChild("##right", ImVec2(0, av.y), 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            draw_right(app);
+            draw_right(app, hWnd);
             ImGui::EndChild();
+            }
         }
         ImGui::EndChild();
-        if (quit_asked && app.running) {                   // never leave an engine behind: the window waits for the picture
+        if (quit_asked && (app.running || living.running)) {      // never leave an engine behind: the window waits for the picture / the film
             const char * t = tr("Avslutar när bilden är klar …", "Closing when the picture is done …");
             const ImVec2 ts = ImGui::CalcTextSize(t);
             ImGui::GetForegroundDrawList()->AddText(ImVec2(vp->Pos.x + px(200), vp->Pos.y + (g_cap_h - ts.y) * 0.5f), ImGui::GetColorU32(C_WARN), t);
@@ -1446,11 +1925,15 @@ int main(int argc, char ** argv) {
             }
         }
         g_pSwapChain->Present(1, 0);
-        if (quit_asked && !app.running) done = true;
+        release_frame_end();                               // textures given up during this frame: no draw list holds them now
+        if (quit_asked && !app.running && !living.running) done = true;
     }
     app.settings_save();
     app.loader.shutdown();
     if (app.th.joinable()) app.th.join();
+    if (living.th.joinable()) living.th.join();
+    living.drop_preview();
+    release_frame_end();                                   // no frame is drawn any more
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

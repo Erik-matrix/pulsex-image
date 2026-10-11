@@ -61,4 +61,5 @@ if(WIN32 AND EXISTS "${FLUX_IMGUI_DIR}/imgui.cpp")
     target_link_libraries(pulsex-image PRIVATE d3d11 dxgi d3dcompiler comdlg32 windowscodecs ole32 shell32 dwmapi)
     target_link_options(pulsex-image PRIVATE "LINKER:/SUBSYSTEM:WINDOWS" "LINKER:/ENTRY:mainCRTStartup"
                         "LINKER:/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/gui.manifest")
+
 endif()

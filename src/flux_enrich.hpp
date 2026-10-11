@@ -152,7 +152,8 @@ inline std::string trim(const std::string & s) {
 
 // The prompt to send. full = false: only the English nouns of the Swedish words (in front); true: the material
 // words too (after the prompt). `added` gets what was put in, in order. Unchanged prompt when nothing matches.
-inline std::string enrich(const Table & t, const std::string & raw, bool full, std::vector<std::string> * added = nullptr) {
+// nouns_first = false: the nouns are appended (before the material words) - Z-Image's order, as enrich.py does it.
+inline std::string enrich(const Table & t, const std::string & raw, bool full, std::vector<std::string> * added = nullptr, bool nouns_first = true) {
     const std::string low = lower(raw);
     auto in = [](const std::vector<std::string> & v, const std::string & s) { return std::find(v.begin(), v.end(), s) != v.end(); };
 
@@ -206,6 +207,10 @@ inline std::string enrich(const Table & t, const std::string & raw, bool full, s
     if (added) *added = used;
     if (used.empty()) return raw;
     std::string body = raw;
+    if (!nouns_first && !head.empty()) {           // "a, b, " in front -> ", a, b" behind
+        tail = ", " + head.substr(0, head.size() - 2) + tail;
+        head.clear();
+    }
     if (!tail.empty()) while (!body.empty() && (body.back() == ' ' || body.back() == ',' || body.back() == '.')) body.pop_back();
     return head + body + tail;
 }

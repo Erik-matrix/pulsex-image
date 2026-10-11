@@ -12,12 +12,17 @@ about 0.15 Wh per picture for the whole computer. It runs **FLUX.2 [klein] 9B** 
 
 ## What it does
 
-- **A description in, a picture out** - 22 seconds for 512 x 512 on a Snapdragon X Plus, 61 seconds for 1024 x 1024.
-- **Four shapes**: square, portrait (512 x 768), landscape (768 x 512), large square (1024 x 1024).
+- **A description in, a picture out** - 22 seconds for 512 x 512 on a Snapdragon X Plus, 32 seconds for a panorama,
+  62 seconds for 1024 x 1024.
+- **Six shapes**: square (512 x 512), portrait (512 x 768), landscape (768 x 512), wide (768 x 432, 16:9), panorama
+  (1152 x 432) and large square (1024 x 1024).
 - **Enlarging** 2x or 4x (up to 2048 on the short side): a portrait poster becomes 1024 x 1536 or 2048 x 3072.
 - **Text on the picture**: a title and a smaller line, at the bottom or the top. The text is put on afterwards, so it
   is spelled as you typed it - a model asked to draw letters draws texture that looks like text.
 - **Start from a picture of your own** (up to two): drop it on the window and describe what to change.
+- **Picture to picture**: the picture you start from is shown as *Before* and the new one as *After*, side by side;
+  the rest of the picture stays. *Continue from After* makes After the next Before, so one picture can be changed
+  step by step - a street into the same street in winter, then at night.
 - **Swedish words are understood**: "en älg i en snöig granskog under norrskenet" gives a moose, "renar på
   höstfjället" gives reindeer. English always works.
 - Pictures are saved as JPEG (quality 95) or PNG in `Pictures\PulseX`, never over an existing file, and the window
@@ -85,7 +90,8 @@ picture of your own needs the encoder of that shape, enlarging needs the upscale
 
 ## Use
 
-Type a description, choose a shape, press **Create picture**. The bar shows the steps and how long is left.
+Type a description, choose a shape, press **Create picture**. For **picture to picture**, switch the mode at the top,
+choose the Before picture (or drop it on the window) and describe the change. The bar shows the steps and how long is left.
 Under the picture: open it, show it in its folder, change it (it becomes the picture to start from), use its
 description again, enlarge it 2x, or add the text that is typed. *More settings* has the variation number (the same
 number and description give the same picture), the number of steps, PNG instead of JPEG, and the help with Swedish

@@ -20,11 +20,18 @@ static int run(int argc, char ** argv) {
     fluxqnn::Graph G;
     G.load(S, bin);
     const std::vector<uint8_t> raw = fluxqnn::read_file(in_path);
-    if (raw.size() != G.in.count * 4) throw std::runtime_error("the input file has " + std::to_string(raw.size() / 4) + " floats, the graph wants " + G.in.str());
-    const std::vector<float> res = G.run((const float *) raw.data());
-    FILE * f = fopen(out_path.c_str(), "wb");
-    if (!f) throw std::runtime_error("cannot write " + out_path);
-    fwrite(res.data(), 4, res.size(), f);
+    FILE * f = nullptr;
+    if (G.in.is_u8() && G.out.is_u8()) {              // 10-02: a quantised network (MiDaS depth, an upscaler): bytes in, bytes out
+        if (raw.size() != G.in.count) throw std::runtime_error("the input file has " + std::to_string(raw.size()) + " bytes, the graph wants " + G.in.str());
+        const std::vector<uint8_t> res = G.run_u8(raw.data());
+        if (!(f = fopen(out_path.c_str(), "wb"))) throw std::runtime_error("cannot write " + out_path);
+        fwrite(res.data(), 1, res.size(), f);
+    } else {
+        if (raw.size() != G.in.count * 4) throw std::runtime_error("the input file has " + std::to_string(raw.size() / 4) + " floats, the graph wants " + G.in.str());
+        const std::vector<float> res = G.run((const float *) raw.data());
+        if (!(f = fopen(out_path.c_str(), "wb"))) throw std::runtime_error("cannot write " + out_path);
+        fwrite(res.data(), 4, res.size(), f);
+    }
     fclose(f);
     fprintf(stderr, "[qnn] %s: in %s, out %s | load %.0f ms, execute %.0f ms, power profile %s\n", G.name.c_str(), G.in.str().c_str(), G.out.str().c_str(),
             G.load_ms, G.run_ms, S.perf_ok() ? "set" : "not set");

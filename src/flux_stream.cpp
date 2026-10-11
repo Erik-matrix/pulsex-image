@@ -886,6 +886,19 @@ static int run(int argc, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    // 2026-10-09: ggml-hexagon's flash softmax drops every weight under 2^-15; P * 2^3 (floor 2^-18) put FLUX 1024^2 2.7x
+    // closer to the CPU reference (latents rel L2 0.105 -> 0.039, picture 28.9 -> 37.8 dB) at no cost; 2^5 overflows fp16
+    // with FLUX's values (measured 2026-10-09). Default here so flux.py, flux-make and the window all get it;
+    // set GGML_HEXAGON_FA_SCALE_EXP2 yourself to override (-1 = ggml's old exp). _putenv_s, not SetEnvironmentVariable:
+    // ggml reads it with getenv, which sees only the CRT's copy.
+    if (!getenv("GGML_HEXAGON_FA_SCALE_EXP2")) _putenv_s("GGML_HEXAGON_FA_SCALE_EXP2", "3");
+    // 2026-10-10: the same exp2 in 14 HVX ops instead of 18 (wan22\patch_ggml_fa_trunc_exp2.py + _trunc_qf.py): 1024^2
+    // transformer 50.0 -> 47.8 s; vs the CPU reference 3.90e-2 -> 4.04e-2, picture 37.78 -> 37.45 dB - the size an
+    // independent rounding perturbation of 9.9e-3 gives after diffusion (sqrt(3.90^2 + 0.99^2) = 4.02); on Wan's attention,
+    // measured directly, 14 ops is the more exact (1.563e-3 vs 1.623e-3). tools\fa_trunc_flux_1010.py. 0 = ggml's recipe.
+    if (!getenv("GGML_HEXAGON_FA_TRUNC_EXP2")) _putenv_s("GGML_HEXAGON_FA_TRUNC_EXP2", "2");
+    fprintf(stderr, "[flux] GGML_HEXAGON_FA_SCALE_EXP2=%s TRUNC_EXP2=%s\n", getenv("GGML_HEXAGON_FA_SCALE_EXP2"),
+            getenv("GGML_HEXAGON_FA_TRUNC_EXP2"));
     try {
         return run(argc, argv);
     } catch (const std::exception & e) {
