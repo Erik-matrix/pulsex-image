@@ -51,6 +51,8 @@ The idle computer draws 7 W. The figures come from the battery's own gauge over 
   `QnnSystem.dll` and `QnnHtpV73Stub.dll` from its `lib\aarch64-windows-msvc`, and the NPU-side module
   `libQnnHtpV73Skel.so` with its catalog `libqnnhtpv73.cat` from its `lib\hexagon-v73\unsigned`. They are Qualcomm's
   and are not in this repository. Without the last two the picture decoder stops with `qnn_open failed, 0x80000406`.
+  Take all five from one and the same SDK build: `QnnHtp.dll` accepts only a skel of its own build, and with a
+  mixed set it falls back, without an error, to the NPU driver's own files.
   (The copies inside the `onnxruntime-qnn` Python package are older and refuse the decoder.)
 - The **models** from Hugging Face (below). 10 to 26 GB on a fast SSD.
 
